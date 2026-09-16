@@ -62,23 +62,60 @@ fi
 
 echo "==> Webhook URL for all tools + assistant: $WEBHOOK_URL"
 
-echo "==> Creating custom-llm credential (Gemini via OpenAI-compatible endpoint)"
-LLM_CREDENTIAL=$(curl -sS -X POST "$API_BASE/credential" \
-  -H "Authorization: Bearer $VAPI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"provider\": \"custom-llm\", \"apiKey\": \"$GEMINI_API_KEY\", \"name\": \"gemini-openai-compat\"}")
-LLM_CREDENTIAL_ID=$(echo "$LLM_CREDENTIAL" | jq -r '.id // empty')
-if [ -z "$LLM_CREDENTIAL_ID" ]; then
-  echo "!! Failed to create custom-llm credential:"; echo "$LLM_CREDENTIAL" | jq .; exit 1
+# Idempotency: re-running this script used to create a brand new credential
+# and 4 new tools every time, littering the account with duplicates (had to
+# be cleaned up by hand during development). Both credential and tool
+# creation now look for an existing match by name first and update it in
+# place instead of creating a new one.
+CREDENTIAL_NAME="gemini-openai-compat"
+EXISTING_CREDENTIAL_ID=$(curl -sS "$API_BASE/credential" -H "Authorization: Bearer $VAPI_API_KEY" \
+  | jq -r --arg n "$CREDENTIAL_NAME" '[.[] | select(.name == $n)][0].id // empty')
+
+if [ -n "$EXISTING_CREDENTIAL_ID" ]; then
+  echo "==> Reusing existing custom-llm credential ($EXISTING_CREDENTIAL_ID)"
+  LLM_CREDENTIAL_ID="$EXISTING_CREDENTIAL_ID"
+else
+  echo "==> Creating custom-llm credential (Gemini via OpenAI-compatible endpoint)"
+  LLM_CREDENTIAL=$(curl -sS -X POST "$API_BASE/credential" \
+    -H "Authorization: Bearer $VAPI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"provider\": \"custom-llm\", \"apiKey\": \"$GEMINI_API_KEY\", \"name\": \"$CREDENTIAL_NAME\"}")
+  LLM_CREDENTIAL_ID=$(echo "$LLM_CREDENTIAL" | jq -r '.id // empty')
+  if [ -z "$LLM_CREDENTIAL_ID" ]; then
+    echo "!! Failed to create custom-llm credential:"; echo "$LLM_CREDENTIAL" | jq .; exit 1
+  fi
 fi
 echo "    id=$LLM_CREDENTIAL_ID"
 
+EXISTING_TOOLS_JSON=$(curl -sS "$API_BASE/tool" -H "Authorization: Bearer $VAPI_API_KEY")
+
 create_tool() {
   local name="$1" description="$2" params_json="$3"
-  curl -sS -X POST "$API_BASE/tool" \
-    -H "Authorization: Bearer $VAPI_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d @- <<JSON
+  local existing_id
+  existing_id=$(echo "$EXISTING_TOOLS_JSON" | jq -r --arg n "$name" '[.[] | select(.function.name == $n)][0].id // empty')
+
+  if [ -n "$existing_id" ]; then
+    curl -sS -X PATCH "$API_BASE/tool/$existing_id" \
+      -H "Authorization: Bearer $VAPI_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d @- <<JSON
+{
+  "function": {
+    "name": "$name",
+    "description": "$description",
+    "parameters": $params_json
+  },
+  "server": {
+    "url": "$WEBHOOK_URL",
+    "secret": "$VAPI_SERVER_SECRET"
+  }
+}
+JSON
+  else
+    curl -sS -X POST "$API_BASE/tool" \
+      -H "Authorization: Bearer $VAPI_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d @- <<JSON
 {
   "type": "function",
   "function": {
@@ -92,6 +129,7 @@ create_tool() {
   }
 }
 JSON
+  fi
 }
 
 echo "==> Creating tool: lookup_patient_by_phone"
@@ -172,7 +210,12 @@ for pair in "lookup_patient_by_phone:$LOOKUP_TOOL_ID" "create_patient:$CREATE_TO
   fi
 done
 
-echo "==> Creating assistant"
+ASSISTANT_ID_TO_UPDATE="${VAPI_ASSISTANT_ID:-}"
+if [ -n "$ASSISTANT_ID_TO_UPDATE" ]; then
+  echo "==> Updating existing assistant $ASSISTANT_ID_TO_UPDATE (VAPI_ASSISTANT_ID set)"
+else
+  echo "==> Creating assistant"
+fi
 ASSISTANT_PAYLOAD=$(jq -n \
   --arg name "Patient Registration Agent" \
   --arg prompt "$SYSTEM_PROMPT" \
@@ -198,14 +241,31 @@ ASSISTANT_PAYLOAD=$(jq -n \
     server: {url: $url, secret: $secret}
   }')
 
-ASSISTANT=$(curl -sS -X POST "$API_BASE/assistant" \
-  -H "Authorization: Bearer $VAPI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$ASSISTANT_PAYLOAD")
-ASSISTANT_ID=$(echo "$ASSISTANT" | jq -r '.id')
+if [ -n "$ASSISTANT_ID_TO_UPDATE" ]; then
+  # PATCH always sends the FULL model object (provider, url, model,
+  # messages, toolIds together) — never patch a subset of `model` fields by
+  # hand. Vapi's PATCH replaces the whole `model` object rather than
+  # merging it, so a partial update (e.g. just changing the model id)
+  # silently deletes the system prompt. That exact mistake took a live
+  # assistant down during development: a hand-run PATCH that omitted
+  # `messages` wiped the system prompt, and every subsequent call failed
+  # with pipeline-error-custom-llm-400-bad-request-validation-failed
+  # because Google's endpoint was receiving no instructions at all.
+  ASSISTANT=$(curl -sS -X PATCH "$API_BASE/assistant/$ASSISTANT_ID_TO_UPDATE" \
+    -H "Authorization: Bearer $VAPI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$ASSISTANT_PAYLOAD")
+  ASSISTANT_ID=$(echo "$ASSISTANT" | jq -r '.id')
+else
+  ASSISTANT=$(curl -sS -X POST "$API_BASE/assistant" \
+    -H "Authorization: Bearer $VAPI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$ASSISTANT_PAYLOAD")
+  ASSISTANT_ID=$(echo "$ASSISTANT" | jq -r '.id')
+fi
 
 if [ "$ASSISTANT_ID" = "null" ] || [ -z "$ASSISTANT_ID" ]; then
-  echo "!! Failed to create assistant:"; echo "$ASSISTANT" | jq .; exit 1
+  echo "!! Failed to create/update assistant:"; echo "$ASSISTANT" | jq .; exit 1
 fi
 echo "    id=$ASSISTANT_ID"
 
