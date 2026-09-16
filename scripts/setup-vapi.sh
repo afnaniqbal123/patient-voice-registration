@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 # Provisions the Vapi assistant, the 4 server tools it calls mid-call, and a
 # free US phone number pointed at that assistant — entirely via Vapi's REST
-# API, so no dashboard clicking is required except the one step Vapi only
-# exposes through its UI: adding your Gemini API key as a provider key.
+# API. No dashboard clicking required at all.
+#
+# LLM wiring note: this deliberately does NOT use Vapi's native
+# model.provider="google" integration. As of Sep 2026, Google routes newly
+# created Gemini API keys away from gemini-2.5-flash, but Vapi's dashboard
+# "Add Google Credential" dialog validates any key with a hardcoded test
+# call against exactly that model — so saving a fresh Gemini key there
+# fails with "Couldn't Validate Google Credential" regardless of which
+# model you actually intend to use. Instead, this script points a
+# `custom-llm` model straight at Google's OpenAI-compatible Gemini endpoint
+# (https://ai.google.dev/gemini-api/docs/openai) using `gemini-flash-latest`
+# — an alias Google hot-swaps to their current recommended flash model, so
+# this doesn't need to be revisited every time a dated model id is retired.
 #
 # Prerequisites (one-time, manual, in the Vapi dashboard):
 #   1. Sign up at https://dashboard.vapi.ai
 #   2. Settings -> API Keys -> copy your Private API Key -> set VAPI_API_KEY
-#   3. Settings -> Integrations -> Google -> paste your Gemini API key
-#      (Vapi does not expose this step over the API; it must be done once
-#      in the dashboard before the assistant can use model.provider=google)
 #
 # Usage:
 #   export VAPI_API_KEY=...
-#   export PUBLIC_API_BASE_URL=https://your-app.up.railway.app
+#   export GEMINI_API_KEY=...
+#   export PUBLIC_API_BASE_URL=https://your-app.onrender.com
 #   export VAPI_SERVER_SECRET=...        # must match the deployed API's env var
 #   ./scripts/setup-vapi.sh
 #
@@ -24,10 +33,12 @@
 set -euo pipefail
 
 : "${VAPI_API_KEY:?Set VAPI_API_KEY to your Vapi private API key}"
-: "${PUBLIC_API_BASE_URL:?Set PUBLIC_API_BASE_URL to your deployed API's public HTTPS URL}"
+: "${GEMINI_API_KEY:?Set GEMINI_API_KEY to your Google AI Studio Gemini API key}"
+: "${PUBLIC_API_BASE_URL:?Set PUBLIC_API_BASE_URL to your deployed API public HTTPS URL}"
 : "${VAPI_SERVER_SECRET:?Set VAPI_SERVER_SECRET to the same secret configured on the server}"
 
-MODEL_ID="${GEMINI_MODEL_ID:-gemini-2.5-flash}"
+MODEL_ID="${GEMINI_MODEL_ID:-gemini-flash-latest}"
+GEMINI_OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
 API_BASE="https://api.vapi.ai"
 WEBHOOK_URL="${PUBLIC_API_BASE_URL%/}/vapi/webhook"
 
@@ -44,6 +55,17 @@ if [ -z "$SYSTEM_PROMPT" ]; then
 fi
 
 echo "==> Webhook URL for all tools + assistant: $WEBHOOK_URL"
+
+echo "==> Creating custom-llm credential (Gemini via OpenAI-compatible endpoint)"
+LLM_CREDENTIAL=$(curl -sS -X POST "$API_BASE/credential" \
+  -H "Authorization: Bearer $VAPI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"provider\": \"custom-llm\", \"apiKey\": \"$GEMINI_API_KEY\", \"name\": \"gemini-openai-compat\"}")
+LLM_CREDENTIAL_ID=$(echo "$LLM_CREDENTIAL" | jq -r '.id // empty')
+if [ -z "$LLM_CREDENTIAL_ID" ]; then
+  echo "!! Failed to create custom-llm credential:"; echo "$LLM_CREDENTIAL" | jq .; exit 1
+fi
+echo "    id=$LLM_CREDENTIAL_ID"
 
 create_tool() {
   local name="$1" description="$2" params_json="$3"
@@ -149,6 +171,8 @@ ASSISTANT_PAYLOAD=$(jq -n \
   --arg name "Patient Registration Agent" \
   --arg prompt "$SYSTEM_PROMPT" \
   --arg model "$MODEL_ID" \
+  --arg llmUrl "$GEMINI_OPENAI_BASE_URL" \
+  --arg credentialId "$LLM_CREDENTIAL_ID" \
   --arg firstMessage "Thanks for calling — this is Casey with patient registration. Are you calling to register as a new patient today?" \
   --arg url "$WEBHOOK_URL" \
   --arg secret "$VAPI_SERVER_SECRET" \
@@ -157,8 +181,10 @@ ASSISTANT_PAYLOAD=$(jq -n \
     name: $name,
     firstMessage: $firstMessage,
     model: {
-      provider: "google",
+      provider: "custom-llm",
+      url: $llmUrl,
       model: $model,
+      credentialId: $credentialId,
       messages: [{role: "system", content: $prompt}],
       toolIds: $toolIds
     },
@@ -199,5 +225,5 @@ echo "Assistant ID: $ASSISTANT_ID"
 echo "To update the assistant after editing prompts/system-prompt.md, run:"
 echo "  curl -X PATCH $API_BASE/assistant/$ASSISTANT_ID \\"
 echo "    -H \"Authorization: Bearer \$VAPI_API_KEY\" -H \"Content-Type: application/json\" \\"
-echo "    -d '{\"model\": {\"provider\": \"google\", \"model\": \"$MODEL_ID\", \"messages\": [...], \"toolIds\": $(echo "$ASSISTANT_PAYLOAD" | jq -c '.model.toolIds')}}'"
+echo "    -d '{\"model\": {\"provider\": \"custom-llm\", \"url\": \"$GEMINI_OPENAI_BASE_URL\", \"model\": \"$MODEL_ID\", \"credentialId\": \"$LLM_CREDENTIAL_ID\", \"messages\": [...], \"toolIds\": $(echo "$ASSISTANT_PAYLOAD" | jq -c '.model.toolIds')}}'"
 echo "================================================================"

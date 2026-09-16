@@ -70,7 +70,7 @@ API uses, so the LLM is never trusted to have already sanitized anything
 | **NestJS + TypeScript** | Requested stack; DI + decorators give a clean module boundary between the REST API and the Vapi webhook adapter without extra ceremony, and `class-validator` DTOs double as the API's server-side validation layer. |
 | **MongoDB (Mongoose)** | Requested stack; the patient record is a single flat document with a few optional fields — no joins needed, so a document model avoids migration ceremony while still enforcing schema/types via Mongoose. |
 | **Vapi** | Provides telephony + STT/TTS + LLM orchestration + **free US phone numbers issued directly from their API/dashboard** — no separate Twilio account, no need to already own a US number. This was the deciding factor since the candidate does not have a US phone number. Also has first-class function-calling with a documented webhook contract. |
-| **Google Gemini (`gemini-2.5-flash`) as the LLM** | Candidate had a Gemini API key on hand; Vapi supports Google as a first-class model provider. Flash tier keeps per-turn latency low, which matters more than raw reasoning depth for a slot-filling conversation. |
+| **Google Gemini (`gemini-flash-latest`) as the LLM** | Candidate had a Gemini API key on hand. Wired via Vapi's `custom-llm` provider against Google's OpenAI-compatible endpoint rather than Vapi's native Google integration — see [section 9](#9-provision-the-voice-agent-vapi) for why. Flash tier keeps per-turn latency low, which matters more than raw reasoning depth for a slot-filling conversation. |
 | **Render (app) + MongoDB Atlas (DB)** | Both have a real, permanent free tier requiring no credit card — Railway's trial expired mid-build. GitHub-integration deploys on Render, and Atlas's M0 tier is free forever. The trade-off (Render free tier's 15-min idle sleep) is mitigated with a free uptime pinger; see [Deployment](#8-deploy-free-render--mongodb-atlas). |
 
 ## 3. Data model
@@ -180,7 +180,7 @@ See [`.env.example`](.env.example) for the full list with comments. Summary:
 | `MONGODB_URI` | app | Mongo connection string. |
 | `VAPI_SERVER_SECRET` | app + `scripts/setup-vapi.sh` | Shared secret validated on every `/vapi/webhook` call via the `x-vapi-secret` header. **Must match** between the deployed app and the Vapi assistant config. |
 | `VAPI_API_KEY` | `scripts/setup-vapi.sh` only | Your Vapi private API key. Never sent to the app itself. |
-| `GEMINI_API_KEY` | you, manually, in the Vapi dashboard | See step 3 below — Vapi doesn't expose this over its API, only through Settings → Integrations. |
+| `GEMINI_API_KEY` | `scripts/setup-vapi.sh` only | Your Google AI Studio Gemini key. Never sent to the app itself — only used to create the `custom-llm` credential on Vapi (see section 9). |
 | `PUBLIC_API_BASE_URL` | `scripts/setup-vapi.sh` only | Your deployed Render URL — becomes the tool-call webhook target. |
 
 No API keys are hardcoded anywhere in the source; secrets only ever come
@@ -237,27 +237,37 @@ actually goes to sleep before/during review.
 ## 9. Provision the voice agent (Vapi)
 
 Vapi's phone numbers and assistant config are fully scriptable via their
-REST API — only one step is dashboard-only (Vapi doesn't expose it over
-the API): adding your Gemini key as a provider credential.
+REST API — **no dashboard configuration needed at all.**
+
+> **Why not Vapi's native "Google" model provider?** As of Sep 2026, Google
+> routes newly-created Gemini API keys away from `gemini-2.5-flash`, but
+> Vapi's dashboard "Add Google Credential" dialog validates any key with a
+> hardcoded test call against exactly that model — so saving a fresh Gemini
+> key there fails with `Couldn't Validate Google Credential`, unrelated to
+> whether your key actually works. `scripts/setup-vapi.sh` routes around
+> this entirely by wiring the assistant as a `custom-llm` pointed straight
+> at [Google's OpenAI-compatible Gemini endpoint](https://ai.google.dev/gemini-api/docs/openai),
+> using the `gemini-flash-latest` alias (Google hot-swaps this to their
+> current recommended flash model, so it won't need revisiting the next
+> time a dated model id gets deprecated). If you hit that dashboard error
+> yourself, you can safely cancel out of it — this repo doesn't need it.
 
 1. Sign up at https://dashboard.vapi.ai (free).
 2. **Settings → API Keys** → copy your **Private Key** → this is
    `VAPI_API_KEY`.
-3. **Settings → Integrations → Google** → paste your Gemini API key. This
-   is the one manual step — Vapi's assistant-creation API has no field to
-   pass a Google key inline, it must already exist as a saved provider key
-   for `model.provider: "google"` to work.
-4. From this repo, run:
+3. From this repo, run:
    ```bash
    export VAPI_API_KEY=...
+   export GEMINI_API_KEY=...              # your Google AI Studio Gemini key
    export PUBLIC_API_BASE_URL=https://<your-app>.onrender.com
    export VAPI_SERVER_SECRET=...   # the exact same value you set in Render's Environment tab
    ./scripts/setup-vapi.sh
    ```
-   This creates the 4 tools, the assistant (system prompt pulled straight
-   from `prompts/system-prompt.md`, so the two never drift), and a free US
-   phone number, then prints the number. It can take a couple of minutes to
-   go live.
+   This creates a `custom-llm` credential from your Gemini key, the 4
+   tools, the assistant (system prompt pulled straight from
+   `prompts/system-prompt.md`, so the two never drift), and a free US phone
+   number, then prints the number. It can take a couple of minutes to go
+   live.
 5. Call the printed number. That's your **phone number to call**.
 
 If you ever edit `prompts/system-prompt.md`, re-run the script (it creates
