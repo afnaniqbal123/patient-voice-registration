@@ -5,9 +5,9 @@ persists their demographic data, and exposes it through a REST API and a
 small read-only dashboard. Built for the CareCloud take-home assessment.
 
 **Repository:** https://github.com/afnaniqbal123/patient-voice-registration
-**Phone number:** _fill in after running `scripts/setup-vapi.sh` — see [Vapi setup](#9-provision-the-voice-agent-vapi)_
-**API base URL:** _fill in after deploying — see [Deployment](#8-deploy-free-render--mongodb-atlas)_
-**Dashboard:** `<API base URL>/dashboard/`
+**Phone number:** +1 (406) 998-2081
+**API base URL:** https://patient-voice-registration.onrender.com
+**Dashboard:** https://patient-voice-registration.onrender.com/dashboard/
 
 ---
 
