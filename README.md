@@ -5,8 +5,8 @@ persists their demographic data, and exposes it through a REST API and a
 small read-only dashboard. Built for the CareCloud take-home assessment.
 
 **Repository:** https://github.com/afnaniqbal123/patient-voice-registration
-**Phone number:** _fill in after running `scripts/setup-vapi.sh` — see [Vapi setup](#3-provision-the-voice-agent-vapi)_
-**API base URL:** _fill in after deploying to Railway — see [Deployment](#4-deploy-to-railway)_
+**Phone number:** _fill in after running `scripts/setup-vapi.sh` — see [Vapi setup](#9-provision-the-voice-agent-vapi)_
+**API base URL:** _fill in after deploying — see [Deployment](#8-deploy-free-render--mongodb-atlas)_
 **Dashboard:** `<API base URL>/dashboard/`
 
 ---
@@ -23,7 +23,7 @@ small read-only dashboard. Built for the CareCloud take-home assessment.
                                │  end-of-call report), shared-secret auth
                                ▼
                     ┌─────────────────────────────────────────┐
-                    │   NestJS API  (Railway)                  │
+                    │   NestJS API  (Render)                    │
                     │                                           │
                     │   VapiController  ──▶  VapiService        │
                     │        (tool-call adapter)     │          │
@@ -71,7 +71,7 @@ API uses, so the LLM is never trusted to have already sanitized anything
 | **MongoDB (Mongoose)** | Requested stack; the patient record is a single flat document with a few optional fields — no joins needed, so a document model avoids migration ceremony while still enforcing schema/types via Mongoose. |
 | **Vapi** | Provides telephony + STT/TTS + LLM orchestration + **free US phone numbers issued directly from their API/dashboard** — no separate Twilio account, no need to already own a US number. This was the deciding factor since the candidate does not have a US phone number. Also has first-class function-calling with a documented webhook contract. |
 | **Google Gemini (`gemini-2.5-flash`) as the LLM** | Candidate had a Gemini API key on hand; Vapi supports Google as a first-class model provider. Flash tier keeps per-turn latency low, which matters more than raw reasoning depth for a slot-filling conversation. |
-| **Railway** | One-click Mongo plugin + GitHub-integration deploys, satisfies the "must be live and callable at review time" requirement without managing infra. |
+| **Render (app) + MongoDB Atlas (DB)** | Both have a real, permanent free tier requiring no credit card — Railway's trial expired mid-build. GitHub-integration deploys on Render, and Atlas's M0 tier is free forever. The trade-off (Render free tier's 15-min idle sleep) is mitigated with a free uptime pinger; see [Deployment](#8-deploy-free-render--mongodb-atlas). |
 
 ## 3. Data model
 
@@ -176,38 +176,63 @@ See [`.env.example`](.env.example) for the full list with comments. Summary:
 
 | Variable | Required by | Purpose |
 |---|---|---|
-| `PORT` | app | HTTP port (Railway sets this automatically). |
+| `PORT` | app | HTTP port (Render sets this automatically). |
 | `MONGODB_URI` | app | Mongo connection string. |
 | `VAPI_SERVER_SECRET` | app + `scripts/setup-vapi.sh` | Shared secret validated on every `/vapi/webhook` call via the `x-vapi-secret` header. **Must match** between the deployed app and the Vapi assistant config. |
 | `VAPI_API_KEY` | `scripts/setup-vapi.sh` only | Your Vapi private API key. Never sent to the app itself. |
 | `GEMINI_API_KEY` | you, manually, in the Vapi dashboard | See step 3 below — Vapi doesn't expose this over its API, only through Settings → Integrations. |
-| `PUBLIC_API_BASE_URL` | `scripts/setup-vapi.sh` only | Your deployed Railway URL — becomes the tool-call webhook target. |
+| `PUBLIC_API_BASE_URL` | `scripts/setup-vapi.sh` only | Your deployed Render URL — becomes the tool-call webhook target. |
 
 No API keys are hardcoded anywhere in the source; secrets only ever come
 from environment variables.
 
-## 8. Deploy to Railway
+## 8. Deploy (free): Render + MongoDB Atlas
 
-You said you'd rather do this through the dashboard than hand me `railway
-login` — here's the exact click path:
+Railway's free trial expired and reactivating it costs money, so this repo
+deploys on a combo that's genuinely free with no credit card: **Render**
+(free web service) for the app, **MongoDB Atlas M0** (free forever) for the
+database. `railway.json` is still in the repo in case you'd rather pay for
+Railway's $5/mo Hobby plan instead — same build/start commands apply there.
 
-1. Go to https://railway.app → **New Project** → **Deploy from GitHub repo**
-   → select `patient-voice-registration`.
-2. Railway auto-detects Node via Nixpacks and reads
-   [`railway.json`](railway.json) for the build/start commands — no
-   Dockerfile needed.
-3. In the same project: **+ New** → **Database** → **Add MongoDB**. Railway
-   provisions a Mongo instance and exposes a `MONGO_URL` reference variable.
-4. On the app service → **Variables**, add:
-   - `MONGODB_URI` → click "Add Reference" → select the Mongo plugin's
-     `MONGO_URL` (keeps the connection string out of your own env block).
-   - `VAPI_SERVER_SECRET` → any long random string you generate, e.g.
-     `openssl rand -hex 32`.
-5. **Settings → Networking → Generate Domain** to get your public
-   `https://<app>.up.railway.app` URL. That's your **API base URL**.
-6. (Optional, once) run the seed script against production data: from your
-   machine, `MONGODB_URI="<the same Mongo URL, with the public/proxy host
-   Railway shows you>" npm run seed`.
+**Trade-off to know about:** Render's free tier spins a service down after
+15 minutes with no inbound traffic, and the next request pays a ~30-60s
+cold-start. Step 5 below sets up a free uptime pinger so the service never
+actually goes to sleep before/during review.
+
+### 8.1 Database — MongoDB Atlas (free, permanent)
+
+1. Sign up at https://www.mongodb.com/cloud/atlas/register (no card
+   required).
+2. Create a free **M0** cluster (any region close to you).
+3. **Database Access** → add a user with a password (save it).
+4. **Network Access** → **Add IP Address** → **Allow Access From Anywhere**
+   (`0.0.0.0/0`) — Render's free tier has no static IP, so this is required
+   unless you're on a paid Render plan with a fixed egress IP.
+5. **Database → Connect → Drivers** → copy the connection string, looks
+   like `mongodb+srv://<user>:<password>@<cluster>.mongodb.net/patient_registration?retryWrites=true&w=majority`.
+   This full string is your `MONGODB_URI`.
+
+### 8.2 App — Render
+
+1. Go to https://dashboard.render.com → **New** → **Web Service** → connect
+   your GitHub account → select `patient-voice-registration`.
+2. Render reads [`render.yaml`](render.yaml) automatically (Blueprint) —
+   confirm plan **Free**, build command `npm run build`, start command
+   `npm run start:prod`. If it doesn't pick up the blueprint automatically,
+   set those two commands manually and set the health check path to
+   `/health`.
+3. Under **Environment**, add:
+   - `MONGODB_URI` → the Atlas connection string from step 8.1.
+   - `VAPI_SERVER_SECRET` → any long random string, e.g. `openssl rand -hex 32`.
+4. Deploy. Your **API base URL** is the `https://<name>.onrender.com` URL
+   Render shows you.
+5. **Keep it warm (free):** sign up at https://uptimerobot.com (or
+   https://cron-job.org) and add a monitor that `GET`s
+   `https://<name>.onrender.com/health` every 5-10 minutes. This is what
+   keeps the phone agent responsive on an unpredictable incoming call
+   instead of eating a cold-start on the first tool call of a demo call.
+6. (Optional, once) seed demo data from your machine:
+   `MONGODB_URI="<same Atlas string>" npm run seed`.
 
 ## 9. Provision the voice agent (Vapi)
 
@@ -225,8 +250,8 @@ the API): adding your Gemini key as a provider credential.
 4. From this repo, run:
    ```bash
    export VAPI_API_KEY=...
-   export PUBLIC_API_BASE_URL=https://<your-railway-app>.up.railway.app
-   export VAPI_SERVER_SECRET=...   # the exact same value you set in Railway's Variables
+   export PUBLIC_API_BASE_URL=https://<your-app>.onrender.com
+   export VAPI_SERVER_SECRET=...   # the exact same value you set in Render's Environment tab
    ./scripts/setup-vapi.sh
    ```
    This creates the 4 tools, the assistant (system prompt pulled straight
@@ -253,14 +278,15 @@ update the existing assistant in place.
   hardening).
 - Every patient create/update/delete and every completed call (with
   summary + transcript) is logged via Nest's `Logger` to stdout — visible
-  in Railway's log viewer — satisfying the observability requirement.
+  in Render's log viewer — satisfying the observability requirement.
   Full transcripts are additionally persisted to the `call_logs` collection
   (bonus) and readable via `GET /call-logs`.
 
 ## 11. Known limitations & trade-offs
 
-- **No automatic retry/backoff on the Vapi→API webhook.** If Railway is
-  mid-deploy when a call lands, that one tool call fails; the prompt tells
+- **No automatic retry/backoff on the Vapi→API webhook.** If the app is
+  mid-deploy (or asleep past the uptime pinger's reach) when a call lands,
+  that one tool call fails; the prompt tells
   the agent to apologize and retry once in-call, but there's no queue/DLQ.
   Acceptable for a 3-hour assessment; a production version would add a
   durable outbox.
@@ -270,8 +296,13 @@ update the existing assistant in place.
   do not put real patient data in this system.
 - **Vapi's free trial phone number is US-only and capped at 10 per
   account** — fine for this assessment, not a real allocation strategy.
-- **Single Mongo instance, no replica set** — acceptable for a take-home;
-  no read/write splitting or failover.
+- **Single Mongo instance, no replica set** (Atlas M0 is a 3-node replica
+  set under the hood, but there's no sharding/read scaling story here) —
+  acceptable for a take-home.
+- **Render's free tier sleeps after 15 min idle** (~30-60s cold start on
+  the next request). Mitigated with a free external uptime pinger (see
+  deployment section) so it should stay warm through review, but a burst
+  of calls after a long idle period could still see one slow first call.
 - **Dashboard has no auth.** It's a read-only view behind an obscure path,
   fine for a reviewer demo, not for anything with real PHI.
 - **Candidate had no US phone number to test with directly** — resolved by
