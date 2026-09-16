@@ -70,7 +70,7 @@ API uses, so the LLM is never trusted to have already sanitized anything
 | **NestJS + TypeScript** | Requested stack; DI + decorators give a clean module boundary between the REST API and the Vapi webhook adapter without extra ceremony, and `class-validator` DTOs double as the API's server-side validation layer. |
 | **MongoDB (Mongoose)** | Requested stack; the patient record is a single flat document with a few optional fields — no joins needed, so a document model avoids migration ceremony while still enforcing schema/types via Mongoose. |
 | **Vapi** | Provides telephony + STT/TTS + LLM orchestration + **free US phone numbers issued directly from their API/dashboard** — no separate Twilio account, no need to already own a US number. This was the deciding factor since the candidate does not have a US phone number. Also has first-class function-calling with a documented webhook contract. |
-| **Google Gemini (`gemini-flash-latest`) as the LLM** | Candidate had a Gemini API key on hand. Wired via Vapi's `custom-llm` provider against Google's OpenAI-compatible endpoint rather than Vapi's native Google integration — see [section 9](#9-provision-the-voice-agent-vapi) for why. Flash tier keeps per-turn latency low, which matters more than raw reasoning depth for a slot-filling conversation. |
+| **Google Gemini (`gemini-flash-lite-latest`) as the LLM** | Candidate had a Gemini API key on hand. Wired via Vapi's `custom-llm` provider against Google's OpenAI-compatible endpoint rather than Vapi's native Google integration — see [section 9](#9-provision-the-voice-agent-vapi) for why. Lite-flash tier keeps per-turn latency low and, as tested live, was actually reachable (the full `gemini-flash-latest` alias was returning 503 "high demand" errors at the time), which matters more than raw reasoning depth for a slot-filling conversation. |
 | **Render (app) + MongoDB Atlas (DB)** | Both have a real, permanent free tier requiring no credit card — Railway's trial expired mid-build. GitHub-integration deploys on Render, and Atlas's M0 tier is free forever. The trade-off (Render free tier's 15-min idle sleep) is mitigated with a free uptime pinger; see [Deployment](#8-deploy-free-render--mongodb-atlas). |
 
 ## 3. Data model
@@ -247,10 +247,14 @@ REST API — **no dashboard configuration needed at all.**
 > whether your key actually works. `scripts/setup-vapi.sh` routes around
 > this entirely by wiring the assistant as a `custom-llm` pointed straight
 > at [Google's OpenAI-compatible Gemini endpoint](https://ai.google.dev/gemini-api/docs/openai),
-> using the `gemini-flash-latest` alias (Google hot-swaps this to their
-> current recommended flash model, so it won't need revisiting the next
-> time a dated model id gets deprecated). If you hit that dashboard error
-> yourself, you can safely cancel out of it — this repo doesn't need it.
+> using the `gemini-flash-lite-latest` alias (Google hot-swaps `-latest`
+> aliases to their current recommended model, so it won't need revisiting
+> the next time a dated model id gets deprecated). Note it's the **lite**
+> tier specifically — the plain `gemini-flash-latest` alias was tested live
+> and returned consistent 503 "high demand" errors from Google, while the
+> lite tier responded instantly and handled function calling correctly. If
+> you hit the dashboard credential error yourself, you can safely cancel
+> out of it — this repo doesn't need it.
 
 1. Sign up at https://dashboard.vapi.ai (free).
 2. **Settings → API Keys** → copy your **Private Key** → this is

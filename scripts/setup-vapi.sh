@@ -11,9 +11,15 @@
 # fails with "Couldn't Validate Google Credential" regardless of which
 # model you actually intend to use. Instead, this script points a
 # `custom-llm` model straight at Google's OpenAI-compatible Gemini endpoint
-# (https://ai.google.dev/gemini-api/docs/openai) using `gemini-flash-latest`
+# (https://ai.google.dev/gemini-api/docs/openai) using a `-latest` alias
 # — an alias Google hot-swaps to their current recommended flash model, so
 # this doesn't need to be revisited every time a dated model id is retired.
+#
+# Model tier note: the default below is gemini-flash-lite-latest, not
+# gemini-flash-latest. The full "flash" tier alias returned consistent 503
+# "high demand" errors / timeouts from Google when this was tested live
+# (Sep 2026); the lite tier responded instantly and handled function
+# calling correctly. Override with GEMINI_MODEL_ID if that changes.
 #
 # Prerequisites (one-time, manual, in the Vapi dashboard):
 #   1. Sign up at https://dashboard.vapi.ai
@@ -37,7 +43,7 @@ set -euo pipefail
 : "${PUBLIC_API_BASE_URL:?Set PUBLIC_API_BASE_URL to your deployed API public HTTPS URL}"
 : "${VAPI_SERVER_SECRET:?Set VAPI_SERVER_SECRET to the same secret configured on the server}"
 
-MODEL_ID="${GEMINI_MODEL_ID:-gemini-flash-latest}"
+MODEL_ID="${GEMINI_MODEL_ID:-gemini-flash-lite-latest}"
 GEMINI_OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
 API_BASE="https://api.vapi.ai"
 WEBHOOK_URL="${PUBLIC_API_BASE_URL%/}/vapi/webhook"
