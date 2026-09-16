@@ -6,6 +6,7 @@ import { join } from 'path';
 import { PatientsModule } from './patients/patients.module';
 import { VapiModule } from './vapi/vapi.module';
 import { CallLogsModule } from './call-logs/call-logs.module';
+import { LlmProxyModule } from './llm-proxy/llm-proxy.module';
 import { HealthController } from './health/health.controller';
 
 @Module({
@@ -21,6 +22,7 @@ import { HealthController } from './health/health.controller';
     PatientsModule,
     VapiModule,
     CallLogsModule,
+    LlmProxyModule,
   ],
   controllers: [HealthController],
 })

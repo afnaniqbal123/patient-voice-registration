@@ -3,48 +3,63 @@
 # free US phone number pointed at that assistant — entirely via Vapi's REST
 # API. No dashboard clicking required at all.
 #
-# LLM wiring note: this deliberately does NOT use Vapi's native
-# model.provider="google" integration. As of Sep 2026, Google routes newly
-# created Gemini API keys away from gemini-2.5-flash, but Vapi's dashboard
-# "Add Google Credential" dialog validates any key with a hardcoded test
-# call against exactly that model — so saving a fresh Gemini key there
-# fails with "Couldn't Validate Google Credential" regardless of which
-# model you actually intend to use. Instead, this script points a
-# `custom-llm` model straight at Google's OpenAI-compatible Gemini endpoint
-# (https://ai.google.dev/gemini-api/docs/openai) using a `-latest` alias
-# — an alias Google hot-swaps to their current recommended flash model, so
-# this doesn't need to be revisited every time a dated model id is retired.
+# LLM wiring note: this deliberately does NOT point Vapi's custom-llm model
+# straight at Google's OpenAI-compatible Gemini endpoint. That was tried
+# first and failed on every real call with
+# pipeline-error-custom-llm-400-bad-request-validation-failed — reproduced
+# directly: Vapi's custom-llm client attaches a `metadata` object to every
+# request for its own call tracing, and Google's OpenAI-compat layer
+# hard-rejects any field it doesn't recognize (`Invalid JSON payload
+# received. Unknown name "metadata": Cannot find field.`) — unlike real
+# OpenAI, which just ignores unknown fields. So instead this points the
+# custom-llm model at THIS REPO'S OWN /llm/chat/completions endpoint
+# (src/llm-proxy/), which strips unrecognized fields via an allowlist
+# before forwarding to Google, then streams the response straight back.
+# The Gemini key lives only as a server env var on the deployed app; Vapi
+# authenticates to our proxy with VAPI_SERVER_SECRET instead.
 #
-# Model tier note: the default below is gemini-flash-lite-latest, not
+# The dashboard's native "Google" model provider was *also* tried and
+# rejected first: as of Sep 2026 Google routes newly-created Gemini API
+# keys away from gemini-2.5-flash, but Vapi's "Add Google Credential"
+# dialog validates any key with a hardcoded test call against exactly that
+# model, so saving a fresh key there fails regardless of whether the key
+# actually works.
+#
+# Model tier note: defaults to gemini-flash-lite-latest, not
 # gemini-flash-latest. The full "flash" tier alias returned consistent 503
-# "high demand" errors / timeouts from Google when this was tested live
-# (Sep 2026); the lite tier responded instantly and handled function
-# calling correctly. Override with GEMINI_MODEL_ID if that changes.
+# "high demand" errors / timeouts from Google when tested live (Sep 2026);
+# the lite tier responded instantly and handled function calling
+# correctly. Override with GEMINI_MODEL_ID if that changes.
 #
-# Prerequisites (one-time, manual, in the Vapi dashboard):
+# Prerequisites:
 #   1. Sign up at https://dashboard.vapi.ai
 #   2. Settings -> API Keys -> copy your Private API Key -> set VAPI_API_KEY
+#   3. Deploy this repo with GEMINI_API_KEY and VAPI_SERVER_SECRET set as
+#      server env vars (see README section 8) — this script does NOT need
+#      your Gemini key at all, only the deployed app does.
 #
 # Usage:
 #   export VAPI_API_KEY=...
-#   export GEMINI_API_KEY=...
 #   export PUBLIC_API_BASE_URL=https://your-app.onrender.com
 #   export VAPI_SERVER_SECRET=...        # must match the deployed API's env var
 #   ./scripts/setup-vapi.sh
 #
-# Re-running this script is safe for the tools/assistant (it always creates
-# new ones); if you want to update an existing assistant instead, see the
-# PATCH commands printed at the end.
+# Re-running this script is idempotent — it reuses the existing credential
+# and tools by name instead of duplicating them. Set VAPI_ASSISTANT_ID to
+# update an existing assistant in place instead of creating a new one.
 
 set -euo pipefail
 
 : "${VAPI_API_KEY:?Set VAPI_API_KEY to your Vapi private API key}"
-: "${GEMINI_API_KEY:?Set GEMINI_API_KEY to your Google AI Studio Gemini API key}"
 : "${PUBLIC_API_BASE_URL:?Set PUBLIC_API_BASE_URL to your deployed API public HTTPS URL}"
 : "${VAPI_SERVER_SECRET:?Set VAPI_SERVER_SECRET to the same secret configured on the server}"
 
 MODEL_ID="${GEMINI_MODEL_ID:-gemini-flash-lite-latest}"
-GEMINI_OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+# Base only, no /chat/completions — Vapi's custom-llm client appends that
+# path itself (confirmed: this is exactly how the working Google-direct
+# config was shaped: "https://generativelanguage.googleapis.com/v1beta/openai/",
+# and requests still reached the real chat-completions handler).
+LLM_PROXY_BASE_URL="${PUBLIC_API_BASE_URL%/}/llm"
 API_BASE="https://api.vapi.ai"
 WEBHOOK_URL="${PUBLIC_API_BASE_URL%/}/vapi/webhook"
 
@@ -72,14 +87,20 @@ EXISTING_CREDENTIAL_ID=$(curl -sS "$API_BASE/credential" -H "Authorization: Bear
   | jq -r --arg n "$CREDENTIAL_NAME" '[.[] | select(.name == $n)][0].id // empty')
 
 if [ -n "$EXISTING_CREDENTIAL_ID" ]; then
-  echo "==> Reusing existing custom-llm credential ($EXISTING_CREDENTIAL_ID)"
+  echo "==> Reusing existing custom-llm credential ($EXISTING_CREDENTIAL_ID), syncing its apiKey"
+  # Keep the credential's apiKey in sync with the current VAPI_SERVER_SECRET
+  # every run — it authenticates Vapi to OUR proxy, not to Google, so it
+  # must always match whatever secret the deployed app currently checks.
+  curl -sS -X PATCH "$API_BASE/credential/$EXISTING_CREDENTIAL_ID" \
+    -H "Authorization: Bearer $VAPI_API_KEY" -H "Content-Type: application/json" \
+    -d "{\"apiKey\": \"$VAPI_SERVER_SECRET\"}" > /dev/null
   LLM_CREDENTIAL_ID="$EXISTING_CREDENTIAL_ID"
 else
   echo "==> Creating custom-llm credential (Gemini via OpenAI-compatible endpoint)"
   LLM_CREDENTIAL=$(curl -sS -X POST "$API_BASE/credential" \
     -H "Authorization: Bearer $VAPI_API_KEY" \
     -H "Content-Type: application/json" \
-    -d "{\"provider\": \"custom-llm\", \"apiKey\": \"$GEMINI_API_KEY\", \"name\": \"$CREDENTIAL_NAME\"}")
+    -d "{\"provider\": \"custom-llm\", \"apiKey\": \"$VAPI_SERVER_SECRET\", \"name\": \"$CREDENTIAL_NAME\"}")
   LLM_CREDENTIAL_ID=$(echo "$LLM_CREDENTIAL" | jq -r '.id // empty')
   if [ -z "$LLM_CREDENTIAL_ID" ]; then
     echo "!! Failed to create custom-llm credential:"; echo "$LLM_CREDENTIAL" | jq .; exit 1
@@ -220,7 +241,7 @@ ASSISTANT_PAYLOAD=$(jq -n \
   --arg name "Patient Registration Agent" \
   --arg prompt "$SYSTEM_PROMPT" \
   --arg model "$MODEL_ID" \
-  --arg llmUrl "$GEMINI_OPENAI_BASE_URL" \
+  --arg llmUrl "$LLM_PROXY_BASE_URL" \
   --argjson credentialIds "$(jq -n --arg id "$LLM_CREDENTIAL_ID" '[$id]')" \
   --arg firstMessage "Thanks for calling — this is Casey with patient registration. Are you calling to register as a new patient today?" \
   --arg url "$WEBHOOK_URL" \
@@ -307,5 +328,5 @@ echo "Assistant ID: $ASSISTANT_ID"
 echo "To update the assistant after editing prompts/system-prompt.md, run:"
 echo "  curl -X PATCH $API_BASE/assistant/$ASSISTANT_ID \\"
 echo "    -H \"Authorization: Bearer \$VAPI_API_KEY\" -H \"Content-Type: application/json\" \\"
-echo "    -d '{\"model\": {\"provider\": \"custom-llm\", \"url\": \"$GEMINI_OPENAI_BASE_URL\", \"model\": \"$MODEL_ID\", \"messages\": [...], \"toolIds\": $(echo "$ASSISTANT_PAYLOAD" | jq -c '.model.toolIds')}}'"
+echo "    -d '{\"model\": {\"provider\": \"custom-llm\", \"url\": \"$LLM_PROXY_BASE_URL\", \"model\": \"$MODEL_ID\", \"messages\": [...], \"toolIds\": $(echo "$ASSISTANT_PAYLOAD" | jq -c '.model.toolIds')}}'"
 echo "================================================================"
