@@ -14,27 +14,31 @@ small read-only dashboard. Built for the CareCloud take-home assessment.
 ## 1. Architecture
 
 ```
-                    ┌─────────────────────┐
-   PSTN call  ─────▶│   Vapi (telephony,  │
-                    │   STT/TTS, Gemini    │
-                    │   LLM orchestration)  │
-                    └──────────┬───────────┘
-                               │  HTTPS webhook (function calls +
-                               │  end-of-call report), shared-secret auth
-                               ▼
-                    ┌─────────────────────────────────────────┐
-                    │   NestJS API  (Render)                    │
-                    │                                           │
-                    │   VapiController  ──▶  VapiService        │
-                    │        (tool-call adapter)     │          │
-                    │                                 ▼          │
-                    │   PatientsController ──▶ PatientsService   │
-                    │        (public REST API)                  │
-                    │                                 │          │
-                    │   CallLogsController            │          │
-                    │        (transcript read API)     │          │
-                    │                                 ▼          │
-                    └─────────────────────────── MongoDB ────────┘
+                    ┌───────────────────────┐
+   PSTN call  ─────▶│   Vapi (telephony,     │
+                    │   STT/TTS, LLM         │
+                    │   orchestration)       │
+                    └──────────┬─────────────┘
+                     │ tool-calls +          │ chat completions
+                     │ end-of-call report    │ (custom-llm), shared-
+                     │ shared-secret auth    │ secret auth
+                     ▼                       ▼
+        ┌───────────────────────────────────────────────────────┐
+        │   NestJS API  (Render)                                 │
+        │                                                         │
+        │   VapiController ──▶ VapiService                       │
+        │        (tool-call adapter)      │                      │
+        │                                 ▼                      │
+        │   PatientsController ──▶ PatientsService                │
+        │        (public REST API)                                │
+        │                                 │                       │
+        │   CallLogsController            │                       │
+        │        (transcript read API)     │                       │
+        │                                 ▼                       │
+        │   LlmProxyController ──▶ Google Gemini (OpenAI-compat)  │
+        │        (sanitizes Vapi's request before forwarding)     │
+        │                                                         │
+        └─────────────────────────── MongoDB ─────────────────────┘
                                ▲
                                │  fetch()
                     ┌──────────┴───────────┐
@@ -57,6 +61,7 @@ API uses, so the LLM is never trusted to have already sanitized anything
 | Telephony + STT/TTS + LLM orchestration | Vapi (hosted) | Vapi dashboard/API, not in this repo |
 | Conversation design | The system prompt | [`prompts/system-prompt.md`](prompts/system-prompt.md) |
 | Tool-call adapter | Translates Vapi's function-call JSON into service calls | [`src/vapi/`](src/vapi) |
+| LLM proxy | Sanitizes Vapi's `custom-llm` requests before forwarding to Google — see [section 9](#9-provision-the-voice-agent-vapi) | [`src/llm-proxy/`](src/llm-proxy) |
 | Data validation + business rules | class-validator DTOs, service layer | [`src/patients/`](src/patients) |
 | Persistence | Mongoose schema/DB | [`src/patients/patient.schema.ts`](src/patients/patient.schema.ts) |
 | Public REST API | HTTP surface for the spec's 5 endpoints | [`src/patients/patients.controller.ts`](src/patients/patients.controller.ts) |
@@ -70,7 +75,7 @@ API uses, so the LLM is never trusted to have already sanitized anything
 | **NestJS + TypeScript** | Requested stack; DI + decorators give a clean module boundary between the REST API and the Vapi webhook adapter without extra ceremony, and `class-validator` DTOs double as the API's server-side validation layer. |
 | **MongoDB (Mongoose)** | Requested stack; the patient record is a single flat document with a few optional fields — no joins needed, so a document model avoids migration ceremony while still enforcing schema/types via Mongoose. |
 | **Vapi** | Provides telephony + STT/TTS + LLM orchestration + **free US phone numbers issued directly from their API/dashboard** — no separate Twilio account, no need to already own a US number. This was the deciding factor since the candidate does not have a US phone number. Also has first-class function-calling with a documented webhook contract. |
-| **Google Gemini (`gemini-flash-lite-latest`) as the LLM** | Candidate had a Gemini API key on hand. Wired via Vapi's `custom-llm` provider against Google's OpenAI-compatible endpoint rather than Vapi's native Google integration — see [section 9](#9-provision-the-voice-agent-vapi) for why. Lite-flash tier keeps per-turn latency low and, as tested live, was actually reachable (the full `gemini-flash-latest` alias was returning 503 "high demand" errors at the time), which matters more than raw reasoning depth for a slot-filling conversation. |
+| **Google Gemini (`gemini-flash-lite-latest`) as the LLM, via a self-hosted proxy** | Candidate had a Gemini API key on hand. Neither of Vapi's two "just use Google" paths worked as-is (native `google` provider: dashboard credential validator hardcodes a test call against a deprecated model; direct `custom-llm` against Google's endpoint: Vapi attaches call-tracking metadata Google's strict endpoint hard-rejects) — see [section 9](#9-provision-the-voice-agent-vapi) for the full story. `src/llm-proxy/` sits in between and fixes both. Lite-flash tier keeps per-turn latency low and, as tested live, was actually reachable (the full `gemini-flash-latest` alias was returning 503 "high demand" errors at the time). |
 | **Render (app) + MongoDB Atlas (DB)** | Both have a real, permanent free tier requiring no credit card — Railway's trial expired mid-build. GitHub-integration deploys on Render, and Atlas's M0 tier is free forever. The trade-off (Render free tier's 15-min idle sleep) is mitigated with a free uptime pinger; see [Deployment](#8-deploy-free-render--mongodb-atlas). |
 
 ## 3. Data model
@@ -224,6 +229,8 @@ actually goes to sleep before/during review.
 3. Under **Environment**, add:
    - `MONGODB_URI` → the Atlas connection string from step 8.1.
    - `VAPI_SERVER_SECRET` → any long random string, e.g. `openssl rand -hex 32`.
+   - `GEMINI_API_KEY` → your Google AI Studio Gemini key. Used server-side
+     by `/llm/chat/completions` (see section 9) — never sent to Vapi.
 4. Deploy. Your **API base URL** is the `https://<name>.onrender.com` URL
    Render shows you.
 5. **Keep it warm (free):** sign up at https://uptimerobot.com (or
@@ -239,44 +246,74 @@ actually goes to sleep before/during review.
 Vapi's phone numbers and assistant config are fully scriptable via their
 REST API — **no dashboard configuration needed at all.**
 
-> **Why not Vapi's native "Google" model provider?** As of Sep 2026, Google
-> routes newly-created Gemini API keys away from `gemini-2.5-flash`, but
-> Vapi's dashboard "Add Google Credential" dialog validates any key with a
-> hardcoded test call against exactly that model — so saving a fresh Gemini
-> key there fails with `Couldn't Validate Google Credential`, unrelated to
-> whether your key actually works. `scripts/setup-vapi.sh` routes around
-> this entirely by wiring the assistant as a `custom-llm` pointed straight
-> at [Google's OpenAI-compatible Gemini endpoint](https://ai.google.dev/gemini-api/docs/openai),
-> using the `gemini-flash-lite-latest` alias (Google hot-swaps `-latest`
-> aliases to their current recommended model, so it won't need revisiting
-> the next time a dated model id gets deprecated). Note it's the **lite**
-> tier specifically — the plain `gemini-flash-latest` alias was tested live
-> and returned consistent 503 "high demand" errors from Google, while the
-> lite tier responded instantly and handled function calling correctly. If
-> you hit the dashboard credential error yourself, you can safely cancel
-> out of it — this repo doesn't need it.
+> **Why does this go through our own `/llm/chat/completions` proxy instead
+> of pointing Vapi straight at Google?** Two more direct approaches were
+> tried first and both failed, live, for reasons undocumented anywhere at
+> the time:
+>
+> 1. **Vapi's native `google` model provider.** Its dashboard "Add Google
+>    Credential" dialog validates any key with a hardcoded test call
+>    against `gemini-2.5-flash` — a model Google now blocks for
+>    newly-created API keys, routing them to newer models instead. So
+>    saving a fresh, perfectly valid Gemini key fails with `Couldn't
+>    Validate Google Credential`, unrelated to whether the key works.
+> 2. **`custom-llm` pointed directly at [Google's OpenAI-compatible Gemini endpoint](https://ai.google.dev/gemini-api/docs/openai).**
+>    This got further — the assistant could be created and configured —
+>    but every real call failed with
+>    `pipeline-error-custom-llm-400-bad-request-validation-failed`.
+>    Reproduced by hand: Vapi's `custom-llm` client attaches a `metadata`
+>    object to every request for its own call tracing. Real OpenAI ignores
+>    fields it doesn't recognize; Google's OpenAI-compat endpoint does not
+>    — it hard-rejects the whole request (`Invalid JSON payload received.
+>    Unknown name "metadata": Cannot find field.`). Confirmed directly
+>    against Google's endpoint with `curl`, isolating `metadata` as the
+>    exact trigger.
+>
+> [`src/llm-proxy/`](src/llm-proxy) fixes this: it's an OpenAI-compatible
+> endpoint Vapi's `custom-llm` model points at, which allowlists only the
+> fields Google's endpoint actually supports, drops everything else
+> (`metadata` included), forwards to Google using the server-side
+> `GEMINI_API_KEY`, and streams the response straight back — verified
+> working for both streaming and non-streaming requests, including with a
+> deliberately reproduced metadata-bearing request. Vapi authenticates to
+> this proxy with `VAPI_SERVER_SECRET` (via a `custom-llm` credential
+> that's for-real just this shared secret, not the Gemini key) — the real
+> Gemini key never leaves this server.
+>
+> Model choice: `gemini-flash-lite-latest`, not `gemini-flash-latest`. The
+> plain flash tier was tested live and returned consistent 503 "high
+> demand" errors from Google; the lite tier responded instantly and
+> handled function calling correctly. `-latest` aliases get hot-swapped by
+> Google to their current recommended model, so this shouldn't need
+> revisiting the next time a dated model id is deprecated.
 
 1. Sign up at https://dashboard.vapi.ai (free).
 2. **Settings → API Keys** → copy your **Private Key** → this is
    `VAPI_API_KEY`.
-3. From this repo, run:
+3. Make sure the app is deployed with `GEMINI_API_KEY` and
+   `VAPI_SERVER_SECRET` set on Render first (section 8, step 3) — the
+   script itself doesn't need your Gemini key at all, only the deployed
+   app does.
+4. From this repo, run:
    ```bash
    export VAPI_API_KEY=...
-   export GEMINI_API_KEY=...              # your Google AI Studio Gemini key
    export PUBLIC_API_BASE_URL=https://<your-app>.onrender.com
    export VAPI_SERVER_SECRET=...   # the exact same value you set in Render's Environment tab
    ./scripts/setup-vapi.sh
    ```
-   This creates a `custom-llm` credential from your Gemini key, the 4
-   tools, the assistant (system prompt pulled straight from
+   This creates a `custom-llm` credential (its apiKey is
+   `VAPI_SERVER_SECRET`, authenticating Vapi to this repo's own
+   `/llm/chat/completions` proxy — not to Google directly), the 4 tools,
+   the assistant (system prompt pulled straight from
    `prompts/system-prompt.md`, so the two never drift), and a free US phone
    number, then prints the number. It can take a couple of minutes to go
    live.
 5. Call the printed number. That's your **phone number to call**.
 
-If you ever edit `prompts/system-prompt.md`, re-run the script (it creates
-fresh tools/assistant) or use the `PATCH` command it prints at the end to
-update the existing assistant in place.
+If you ever edit `prompts/system-prompt.md`, either re-run the script with
+`VAPI_ASSISTANT_ID=<id>` set (updates the existing assistant/tools/
+credential in place, no duplicates) or use the `PATCH` command it prints
+at the end.
 
 ## 10. Security & observability
 
