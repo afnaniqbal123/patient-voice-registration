@@ -172,7 +172,7 @@ ASSISTANT_PAYLOAD=$(jq -n \
   --arg prompt "$SYSTEM_PROMPT" \
   --arg model "$MODEL_ID" \
   --arg llmUrl "$GEMINI_OPENAI_BASE_URL" \
-  --arg credentialId "$LLM_CREDENTIAL_ID" \
+  --argjson credentialIds "$(jq -n --arg id "$LLM_CREDENTIAL_ID" '[$id]')" \
   --arg firstMessage "Thanks for calling — this is Casey with patient registration. Are you calling to register as a new patient today?" \
   --arg url "$WEBHOOK_URL" \
   --arg secret "$VAPI_SERVER_SECRET" \
@@ -180,11 +180,11 @@ ASSISTANT_PAYLOAD=$(jq -n \
   '{
     name: $name,
     firstMessage: $firstMessage,
+    credentialIds: $credentialIds,
     model: {
       provider: "custom-llm",
       url: $llmUrl,
       model: $model,
-      credentialId: $credentialId,
       messages: [{role: "system", content: $prompt}],
       toolIds: $toolIds
     },
@@ -203,11 +203,27 @@ if [ "$ASSISTANT_ID" = "null" ] || [ -z "$ASSISTANT_ID" ]; then
 fi
 echo "    id=$ASSISTANT_ID"
 
-echo "==> Provisioning free US phone number (Vapi trial numbers: up to 10/account)"
-PHONE=$(curl -sS -X POST "$API_BASE/phone-number" \
-  -H "Authorization: Bearer $VAPI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"provider\": \"vapi\", \"name\": \"Patient Registration Line\", \"assistantId\": \"$ASSISTANT_ID\"}")
+echo "==> Checking for an existing free Vapi phone number to reuse"
+EXISTING_PHONE_ID=$(curl -sS "$API_BASE/phone-number" -H "Authorization: Bearer $VAPI_API_KEY" \
+  | jq -r '[.[] | select(.provider == "vapi")][0].id // empty')
+
+if [ -n "$EXISTING_PHONE_ID" ]; then
+  # Vapi's free tier caps out at a small number of numbers per account, and
+  # re-running this script shouldn't accumulate new ones every time — just
+  # repoint whichever free number already exists at the freshly created
+  # assistant.
+  echo "    Found existing number ($EXISTING_PHONE_ID) — repointing it at the new assistant"
+  PHONE=$(curl -sS -X PATCH "$API_BASE/phone-number/$EXISTING_PHONE_ID" \
+    -H "Authorization: Bearer $VAPI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"assistantId\": \"$ASSISTANT_ID\"}")
+else
+  echo "==> Provisioning a free US phone number (area code: ${VAPI_AREA_CODE:-415})"
+  PHONE=$(curl -sS -X POST "$API_BASE/phone-number" \
+    -H "Authorization: Bearer $VAPI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"provider\": \"vapi\", \"numberDesiredAreaCode\": \"${VAPI_AREA_CODE:-415}\", \"name\": \"Patient Registration Line\", \"assistantId\": \"$ASSISTANT_ID\"}")
+fi
 
 PHONE_NUMBER=$(echo "$PHONE" | jq -r '.number // empty')
 
@@ -217,7 +233,7 @@ if [ -n "$PHONE_NUMBER" ]; then
   echo "Success. Call this number to test:  $PHONE_NUMBER"
   echo "(Number can take a couple of minutes to become active.)"
 else
-  echo "Phone number response (check for errors, e.g. 10-number limit reached):"
+  echo "Phone number response (check for errors, e.g. free-number limit reached):"
   echo "$PHONE" | jq .
 fi
 echo ""
@@ -225,5 +241,5 @@ echo "Assistant ID: $ASSISTANT_ID"
 echo "To update the assistant after editing prompts/system-prompt.md, run:"
 echo "  curl -X PATCH $API_BASE/assistant/$ASSISTANT_ID \\"
 echo "    -H \"Authorization: Bearer \$VAPI_API_KEY\" -H \"Content-Type: application/json\" \\"
-echo "    -d '{\"model\": {\"provider\": \"custom-llm\", \"url\": \"$GEMINI_OPENAI_BASE_URL\", \"model\": \"$MODEL_ID\", \"credentialId\": \"$LLM_CREDENTIAL_ID\", \"messages\": [...], \"toolIds\": $(echo "$ASSISTANT_PAYLOAD" | jq -c '.model.toolIds')}}'"
+echo "    -d '{\"model\": {\"provider\": \"custom-llm\", \"url\": \"$GEMINI_OPENAI_BASE_URL\", \"model\": \"$MODEL_ID\", \"messages\": [...], \"toolIds\": $(echo "$ASSISTANT_PAYLOAD" | jq -c '.model.toolIds')}}'"
 echo "================================================================"
