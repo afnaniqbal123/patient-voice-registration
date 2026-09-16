@@ -34,10 +34,7 @@ export class VapiController {
         const normalized = toolCallList.map((tc: any) => ({
           id: tc.id,
           name: tc.name || tc.function?.name,
-          arguments:
-            typeof tc.arguments === 'string'
-              ? safeJsonParse(tc.arguments)
-              : tc.arguments || safeJsonParse(tc.function?.arguments) || {},
+          arguments: parseArguments(tc.arguments ?? tc.function?.arguments),
         }));
         const results = await this.vapiService.handleToolCalls(normalized);
         return { results };
@@ -65,11 +62,21 @@ export class VapiController {
   }
 }
 
-function safeJsonParse(value: any) {
-  if (!value) return undefined;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
+// Vapi's tool-call arguments arrive as a JSON string in some payload shapes
+// and as an already-parsed object in others. Blindly JSON.parse()-ing an
+// object throws, and a naive fallback silently swallowed that into `{}` —
+// losing the real arguments entirely and crashing downstream on an
+// undefined field (e.g. phone_number.replace(...) in PatientsService).
+// This handles both shapes explicitly instead of guessing.
+function parseArguments(value: any): Record<string, any> {
+  if (value == null) return {};
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return {};
+    }
   }
+  if (typeof value === 'object') return value;
+  return {};
 }
